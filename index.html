@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<!-- Outils compétition SIUS / ISIS WEB — Ligue de Tir Languedoc-Roussillon — v1.1 — 07/11/2026 (mot de passe définitif) -->
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Outils compétition — SIUS / ISIS WEB</title>
+<style>
+  :root{ --bleu:#1F3864; --bleu2:#2E5597; --fond:#F4F6FA; --carte:#fff; --bord:#D9DFEA; --texte:#1B2330; --gris:#5E6B80; --vert:#1E7B4A; --rouge:#B42318; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--fond);color:var(--texte);font-size:15px}
+  header{background:var(--bleu);color:#fff;padding:22px 28px;display:flex;align-items:center;gap:18px}
+  header img{height:58px;background:#fff;border-radius:10px;padding:4px}
+  header h1{margin:0;font-size:22px;font-weight:650}
+  header p{margin:5px 0 0;opacity:.8;font-size:14px}
+  main{max-width:980px;margin:0 auto;padding:28px 20px 60px}
+  .cache{display:none !important}
+
+  /* Connexion */
+  .connexion{max-width:380px;margin:50px auto;background:var(--carte);border:1px solid var(--bord);border-radius:14px;padding:28px;text-align:center;box-shadow:0 6px 24px rgba(31,56,100,.08)}
+  .connexion h2{margin:0 0 6px;color:var(--bleu);font-size:19px}
+  .connexion p{color:var(--gris);font-size:13.5px;margin:0 0 18px}
+  .connexion input{width:100%;font:inherit;padding:11px 12px;border:1px solid var(--bord);border-radius:8px;margin-bottom:12px}
+  .connexion input:focus{outline:2px solid var(--bleu2);border-color:transparent}
+  .erreur{color:var(--rouge);font-size:13.5px;min-height:18px;margin-top:8px}
+
+  button,.bouton{font:inherit;border:0;border-radius:8px;padding:11px 20px;cursor:pointer;font-weight:600;background:var(--bleu);color:#fff;text-decoration:none;display:inline-block}
+  button:hover,.bouton:hover{background:var(--bleu2)}
+  .secondaire{background:#fff;color:var(--bleu);border:1px solid var(--bord)}
+  .secondaire:hover{background:#EEF3FB}
+
+  /* Circuit */
+  .circuit{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;background:var(--carte);border:1px solid var(--bord);border-radius:12px;padding:14px;margin-bottom:22px;font-size:13.5px;color:var(--gris)}
+  .etape{background:#EEF3FB;color:var(--bleu);border-radius:20px;padding:6px 12px;font-weight:600}
+  .fleche{color:var(--bleu2);font-weight:700}
+
+  .outils{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:760px){.outils{grid-template-columns:1fr} header{flex-direction:column;text-align:center}}
+  .outil{background:var(--carte);border:1px solid var(--bord);border-radius:14px;padding:22px;display:flex;flex-direction:column;gap:10px}
+  .outil .tag{align-self:flex-start;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:4px 10px;border-radius:20px}
+  .aller .tag{background:#EEF3FB;color:var(--bleu)}
+  .retour .tag{background:#E8F5EE;color:var(--vert)}
+  .outil h3{margin:0;font-size:18px;color:var(--bleu)}
+  .outil p{margin:0;color:var(--gris);font-size:14px;line-height:1.5}
+  .outil ul{margin:0;padding-left:18px;color:var(--gris);font-size:13.5px;line-height:1.55}
+  .outil .actions{margin-top:auto;padding-top:8px;display:flex;gap:10px;flex-wrap:wrap}
+  .retour .bouton:not(.secondaire){background:var(--vert)} .retour .bouton:not(.secondaire):hover{background:#17663D}
+
+  .horsligne{background:var(--carte);border:1px solid var(--bord);border-left:4px solid var(--bleu2);border-radius:12px;padding:16px 20px;margin-top:22px;font-size:14px;line-height:1.55}
+  .horsligne h3{margin:0 0 6px;font-size:15px;color:var(--bleu)}
+  .horsligne .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+  .pied{display:flex;justify-content:space-between;align-items:center;margin-top:28px;color:var(--gris);font-size:12px;flex-wrap:wrap;gap:10px}
+</style>
+</head>
+<body>
+<header>
+  <img src="logo.png" alt="" onerror="if(!this.dataset.essai){this.dataset.essai=1;this.src='../logo.png'}else{this.remove()}">
+  <div>
+    <h1>Outils compétition — SIUS / ISIS WEB</h1>
+    <p>Ligue de Tir Languedoc-Roussillon · réservé aux opérateurs de cibles électroniques</p>
+  </div>
+</header>
+
+<main>
+  <!-- ===== Connexion ===== -->
+  <section class="connexion" id="ecranConnexion">
+    <h2>🔒 Accès opérateurs</h2>
+    <p>Saisis le mot de passe communiqué par la Ligue.</p>
+    <form id="formConnexion" autocomplete="off">
+      <input type="password" id="motDePasse" placeholder="Mot de passe" autofocus>
+      <button type="submit" style="width:100%">Entrer</button>
+    </form>
+    <div class="erreur" id="erreur"></div>
+  </section>
+
+  <!-- ===== Outils ===== -->
+  <section class="cache" id="ecranOutils">
+    <div class="circuit">
+      <span class="etape">ISIS WEB</span><span class="fleche">→</span>
+      <span class="etape">① Convertisseur</span><span class="fleche">→</span>
+      <span class="etape">SIUS (match)</span><span class="fleche">→</span>
+      <span class="etape">② SIUS vers ISIS WEB</span><span class="fleche">→</span>
+      <span class="etape">ISIS WEB</span>
+    </div>
+
+    <div class="outils">
+      <article class="outil aller">
+        <span class="tag">① Avant le match</span>
+        <h3>Convertisseur FFTir → SIUS</h3>
+        <p>Transforme l'export ISIS WEB de la compétition en listes de départ à charger dans SIUSData, une par série.</p>
+        <ul>
+          <li>Fichier : ISIS WEB → « Export &amp; impressions » → SIUS → « Télécharger »</li>
+          <li>Contrôle des postes et des dossards avant génération</li>
+          <li>CSV au format Windows pour le PC SIUS</li>
+        </ul>
+        <div class="actions">
+          <a class="bouton" href="convertisseur-fftir-sius.html">Ouvrir le convertisseur</a>
+        </div>
+      </article>
+
+      <article class="outil retour">
+        <span class="tag">② Après chaque série</span>
+        <h3>SIUS vers ISIS WEB</h3>
+        <p>Transforme les tirs enregistrés par SIUSData en fichier « saisie hors ligne » à réimporter dans ISIS WEB — fini la ressaisie.</p>
+        <ul>
+          <li>Fichiers : CSV de tirs SIUSData + saisie hors ligne ISIS WEB</li>
+          <li>Carabine au dixième (3x20 en entiers), pistolet en entiers</li>
+          <li>Alerte si les fichiers ne viennent pas de la même compétition</li>
+        </ul>
+        <div class="actions">
+          <a class="bouton" href="sius-isisweb.html">Ouvrir SIUS vers ISIS WEB</a>
+        </div>
+      </article>
+    </div>
+
+    <div class="horsligne">
+      <h3>📴 Versions hors ligne (sans internet)</h3>
+      Si le PC du stand n'a pas de connexion, télécharge ces versions à l'avance et garde-les sur le PC ou une clé USB : elles fonctionnent à l'identique, sans internet, en double-cliquant dessus.
+      <div class="actions">
+        <a class="bouton secondaire" href="hors-ligne/Convertisseur_FFTir_SIUS_autonome.html" download>⬇ Convertisseur (hors ligne)</a>
+        <a class="bouton secondaire" href="hors-ligne/SIUS_vers_ISISWEB_autonome.html" download>⬇ SIUS vers ISIS WEB (hors ligne)</a>
+      </div>
+    </div>
+
+    <div class="pied">
+      <span>Outils compétition v1.1 — 07/11/2026</span>
+      <button class="secondaire" id="btnDeconnexion">Se déconnecter</button>
+    </div>
+  </section>
+</main>
+
+<script>
+(function(){
+  // Empreinte SHA-256 du mot de passe (le mot de passe lui-même n'est pas écrit dans la page).
+  // Pour le changer : demander une nouvelle empreinte et remplacer la valeur ci-dessous.
+  const EMPREINTE = 'c1f15159d87bf28fd646e4c2fd9698b87def1c38eecc5f5a4e3c93fb92dcdf85';
+  const CLE = 'outilsLR';
+
+  const $ = id => document.getElementById(id);
+  const ouvert = () => { try { return sessionStorage.getItem(CLE) === 'ok'; } catch(e){ return false; } };
+  function afficher(){
+    const ok = ouvert();
+    $('ecranConnexion').classList.toggle('cache', ok);
+    $('ecranOutils').classList.toggle('cache', !ok);
+    if (ok){
+      const retour = new URLSearchParams(location.search).get('retour');
+      if (retour && /^[\w.-]+\.html$/.test(retour)) location.replace(retour);
+    }
+  }
+  async function empreinte(txt){
+    const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(txt));
+    return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  $('formConnexion').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const mdp = $('motDePasse').value.trim();
+    if (!mdp) return;
+    if (await empreinte(mdp) === EMPREINTE){
+      try { sessionStorage.setItem(CLE, 'ok'); } catch(e){}
+      $('erreur').textContent = ''; afficher();
+    } else {
+      $('erreur').textContent = 'Mot de passe incorrect.';
+      $('motDePasse').select();
+    }
+  });
+  $('btnDeconnexion').addEventListener('click', () => { try { sessionStorage.removeItem(CLE); } catch(e){} $('motDePasse').value = ''; afficher(); });
+  afficher();
+})();
+</script>
+</body>
+</html>

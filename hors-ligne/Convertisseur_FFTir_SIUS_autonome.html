@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<!-- Convertisseur FFTir → SIUS — v2.2 autonome — 07/11/2026 : fonctionne sans internet (aucune bibliothèque externe) -->
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Convertisseur FFTir → SIUS</title>
+    <script>
+/* ===== MiniXLSX — lecture / écriture Excel (.xlsx) et ZIP sans aucune dépendance ni connexion =====
+   Utilise uniquement les fonctions intégrées aux navigateurs récents (DecompressionStream). */
+const MiniXLSX = (() => {
+  const te = new TextEncoder(), td = new TextDecoder('utf-8');
+
+  // ---------- CRC32 ----------
+  const TABLE = new Uint32Array(256);
+  for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; TABLE[n] = c >>> 0; }
+  const crc32 = d => { let c = 0xFFFFFFFF; for (let i = 0; i < d.length; i++) c = TABLE[(c ^ d[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+
+  // ---------- Lecture ZIP ----------
+  async function inflate(data){
+    const flux = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(flux).arrayBuffer());
+  }
+  async function lireZip(buf){
+    const u = new Uint8Array(buf), v = new DataView(u.buffer, u.byteOffset, u.byteLength);
+    let e = u.length - 22;
+    while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;
+    if (e < 0) throw new Error('fichier non reconnu (ce n’est pas un fichier Excel .xlsx)');
+    const nb = v.getUint16(e + 10, true); let p = v.getUint32(e + 16, true);
+    const fichiers = new Map();
+    for (let i = 0; i < nb; i++){
+      if (v.getUint32(p, true) !== 0x02014b50) throw new Error('fichier Excel endommagé');
+      const methode = v.getUint16(p + 10, true), taille = v.getUint32(p + 20, true);
+      const ln = v.getUint16(p + 28, true), lx = v.getUint16(p + 30, true), lc = v.getUint16(p + 32, true);
+      const local = v.getUint32(p + 42, true);
+      const nom = td.decode(u.subarray(p + 46, p + 46 + ln));
+      const debut = local + 30 + v.getUint16(local + 26, true) + v.getUint16(local + 28, true);
+      const brut = u.subarray(debut, debut + taille);
+      fichiers.set(nom, methode === 0 ? brut.slice() : methode === 8 ? await inflate(brut) : null);
+      p += 46 + ln + lx + lc;
+    }
+    return fichiers;
+  }
+
+  // ---------- Écriture ZIP (sans compression, accepté par Excel / LibreOffice / ISIS WEB) ----------
+  function creerZip(entrees){   // [{nom, data:Uint8Array}]
+    const d = new Date();
+    const heure = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    const morceaux = [], central = []; let pos = 0;
+    for (const { nom, data } of entrees){
+      const n = te.encode(nom), crc = crc32(data);
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+      h.setUint16(10, heure, true); h.setUint16(12, date, true); h.setUint32(14, crc, true);
+      h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, n.length, true); h.setUint16(28, 0, true);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true);
+      c.setUint16(12, heure, true); c.setUint16(14, date, true); c.setUint32(16, crc, true);
+      c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, n.length, true);
+      c.setUint32(42, pos, true);
+      morceaux.push(new Uint8Array(h.buffer), n, data);
+      central.push(new Uint8Array(c.buffer), n);
+      pos += 30 + n.length + data.length;
+    }
+    const tailleCentral = central.reduce((a, x) => a + x.length, 0);
+    const fin = new DataView(new ArrayBuffer(22));
+    fin.setUint32(0, 0x06054b50, true); fin.setUint16(8, entrees.length, true); fin.setUint16(10, entrees.length, true);
+    fin.setUint32(12, tailleCentral, true); fin.setUint32(16, pos, true);
+    const tout = [...morceaux, ...central, new Uint8Array(fin.buffer)];
+    const out = new Uint8Array(tout.reduce((a, x) => a + x.length, 0)); let o = 0;
+    for (const x of tout){ out.set(x, o); o += x.length; }
+    return out;
+  }
+
+  // ---------- Outils XML ----------
+  const decXml = s => s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (m, e) =>
+    e === 'amp' ? '&' : e === 'lt' ? '<' : e === 'gt' ? '>' : e === 'quot' ? '"' : e === 'apos' ? "'" :
+    e[1] === 'x' ? String.fromCodePoint(parseInt(e.slice(2), 16)) : String.fromCodePoint(parseInt(e.slice(1), 10)));
+  const encXml = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]))
+                               .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  const attr = (a, n) => { const m = new RegExp('(?:^|\\s)' + n + '="([^"]*)"').exec(a); return m ? decXml(m[1]) : null; };
+  const texteDe = x => { let t = ''; x.replace(/<rPh\b[\s\S]*?<\/rPh>/g, '').replace(/<t\b[^>]*>([\s\S]*?)<\/t>/g, (m, a) => { t += a; return m; }); return decXml(t); };
+  const colNum = lettres => { let n = 0; for (const ch of lettres) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+  const colLettres = n => { let s = ''; n++; while (n > 0){ const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
+  const RE_CELL = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g, RE_ROW = /<row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/row>)/g;
+
+  // ---------- Lecture d'un classeur ----------
+  // Renvoie { SheetNames:[...], Sheets:{ nom: lignes[][] }, chemins:{ nom: 'xl/worksheets/sheet1.xml' }, fichiers }
+  // lignes[0] = ligne 1 d'Excel ; cellule vide = null ; nombres en Number, textes en String.
+  async function lire(buf){
+    const f = await lireZip(buf);
+    const txt = n => f.has(n) ? td.decode(f.get(n)) : null;
+    const wbx = txt('xl/workbook.xml'); if (!wbx) throw new Error('fichier Excel non reconnu (workbook absent)');
+    const rels = {}; (txt('xl/_rels/workbook.xml.rels') || '').replace(/<Relationship\b([^>]*?)\/?>/g, (m, a) => { rels[attr(a, 'Id')] = attr(a, 'Target'); return m; });
+    const partages = []; (txt('xl/sharedStrings.xml') || '').replace(/<si\b[^>]*>([\s\S]*?)<\/si>/g, (m, x) => { partages.push(texteDe(x)); return m; });
+    const wb = { SheetNames:[], Sheets:{}, chemins:{}, fichiers:f };
+    const feuilles = []; wbx.replace(/<sheet\b([^>]*?)\/?>/g, (m, a) => { feuilles.push(a); return m; });
+    for (const a of feuilles){
+      const nom = attr(a, 'name'), rid = attr(a, 'r:id');
+      let cible = rels[rid] || ''; cible = cible.startsWith('/') ? cible.slice(1) : 'xl/' + cible.replace(/^\.\//, '');
+      const xml = txt(cible); if (xml === null) continue;
+      const lignes = []; let numLigne = 0;
+      xml.replace(RE_ROW, (m, ra, contenu) => {
+        const r = attr(ra, 'r'); numLigne = r ? +r : numLigne + 1;
+        const ligne = []; let col = -1;
+        (contenu || '').replace(RE_CELL, (mc, ca, cc) => {
+          const ref = attr(ca, 'r'); col = ref ? colNum(ref.replace(/\d+/g, '')) : col + 1;
+          const t = attr(ca, 't'); let val = null; cc = cc || '';
+          const vm = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(cc);
+          if (t === 's') val = vm ? (partages[+vm[1]] ?? '') : null;
+          else if (t === 'inlineStr') val = texteDe(cc);
+          else if (t === 'str' || t === 'e') val = vm ? decXml(vm[1]) : null;
+          else if (t === 'b') val = vm ? vm[1] === '1' : null;
+          else if (vm){ const n = Number(vm[1]); val = isNaN(n) ? decXml(vm[1]) : n; }
+          if (val === '') val = null;
+          while (ligne.length < col) ligne.push(null);
+          ligne[col] = val;
+          return mc;
+        });
+        while (lignes.length < numLigne - 1) lignes.push([]);
+        lignes[numLigne - 1] = ligne;
+        return m;
+      });
+      wb.SheetNames.push(nom); wb.Sheets[nom] = lignes; wb.chemins[nom] = cible;
+    }
+    return wb;
+  }
+
+  // ---------- Modification de cellules dans un classeur existant (mise en forme conservée) ----------
+  // ecritures : [{ feuille, ligne (0 = ligne 1), colonne (0 = A), valeur (nombre ou texte) }]
+  function modifier(wb, ecritures){
+    const parFeuille = new Map();
+    for (const e of ecritures){ if (!parFeuille.has(e.feuille)) parFeuille.set(e.feuille, []); parFeuille.get(e.feuille).push(e); }
+    const nouveaux = new Map();
+    for (const [feuille, liste] of parFeuille){
+      const chemin = wb.chemins[feuille]; if (!chemin) throw new Error('onglet introuvable : ' + feuille);
+      let xml = td.decode(wb.fichiers.get(chemin));
+      const parLigne = new Map();
+      for (const e of liste){ const r = e.ligne + 1; if (!parLigne.has(r)) parLigne.set(r, new Map()); parLigne.get(r).set(e.colonne, e.valeur); }
+      const celluleXml = (r, c, v, style) => {
+        const ref = colLettres(c) + r, s = style ? ` s="${style}"` : '';
+        if (v === null || v === undefined || v === '') return `<c r="${ref}"${s}/>`;
+        return typeof v === 'number' ? `<c r="${ref}"${s}><v>${v}</v></c>`
+                                     : `<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${encXml(v)}</t></is></c>`;
+      };
+      const reconstruire = (r, attrs, contenu, modifs) => {
+        const cellules = new Map(); let col = -1;
+        (contenu || '').replace(RE_CELL, (mc, ca) => {
+          const ref = attr(ca, 'r'); col = ref ? colNum(ref.replace(/\d+/g, '')) : col + 1;
+          cellules.set(col, { xml:mc, style:attr(ca, 's') }); return mc;
+        });
+        for (const [c, v] of modifs) cellules.set(c, { xml:celluleXml(r, c, v, cellules.get(c)?.style) });
+        const tri = [...cellules.entries()].sort((a, b) => a[0] - b[0]).map(x => x[1].xml).join('');
+        return `<row${attrs}>${tri}</row>`;
+      };
+      if (/<sheetData\s*\/>/.test(xml)) xml = xml.replace(/<sheetData\s*\/>/, '<sheetData></sheetData>');
+      const vues = new Set(); let numLigne = 0;
+      xml = xml.replace(/<sheetData>([\s\S]*?)<\/sheetData>/, (m, contenu) => {
+        let res = contenu.replace(RE_ROW, (mr, ra, rc) => {
+          const r0 = attr(ra, 'r'); numLigne = r0 ? +r0 : numLigne + 1;
+          const modifs = parLigne.get(numLigne); if (!modifs) return mr;
+          vues.add(numLigne);
+          const attrs = r0 ? ra : ra + ` r="${numLigne}"`;
+          return reconstruire(numLigne, attrs, rc, modifs);
+        });
+        // lignes absentes du fichier : ajoutées dans l'ordre
+        const manquantes = [...parLigne.keys()].filter(r => !vues.has(r)).sort((a, b) => a - b);
+        for (const r of manquantes){
+          const nouvelle = reconstruire(r, ` r="${r}"`, '', parLigne.get(r));
+          let insere = false;
+          res = res.replace(RE_ROW, (mr, ra) => { if (!insere && +(attr(ra, 'r') || 0) > r){ insere = true; return nouvelle + mr; } return mr; });
+          if (!insere) res += nouvelle;
+        }
+        return `<sheetData>${res}</sheetData>`;
+      });
+      nouveaux.set(chemin, te.encode(xml));
+    }
+    const entrees = [];
+    for (const [nom, data] of wb.fichiers){
+      if (nom === 'xl/calcChain.xml' || data === null) continue;
+      let d = nouveaux.get(nom) || data;
+      if (nom === '[Content_Types].xml') d = te.encode(td.decode(d).replace(/<Override\b[^>]*calcChain[^>]*\/>/g, ''));
+      if (nom === 'xl/_rels/workbook.xml.rels') d = te.encode(td.decode(d).replace(/<Relationship\b[^>]*calcChain[^>]*\/>/g, ''));
+      entrees.push({ nom, data:d });
+    }
+    return creerZip(entrees);
+  }
+
+  // ---------- Création d'un classeur neuf ----------
+  // feuilles : [{ nom, lignes:[[...]], largeurs:[nb caractères...], gras:[n° de lignes (0 = 1re) en gras] }]
+  function creer(feuilles){
+    const propre = n => String(n).replace(/[\[\]:*?\/\\]/g, '-').slice(0, 31) || 'Feuille';
+    const entrees = [];
+    const ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+      '<Default Extension="xml" ContentType="application/xml"/>',
+      '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+      '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+      ...feuilles.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`),
+      '</Types>'].join('');
+    entrees.push({ nom:'[Content_Types].xml', data:te.encode(ct) });
+    entrees.push({ nom:'_rels/.rels', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>') });
+    entrees.push({ nom:'xl/workbook.xml', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+      feuilles.map((f, i) => `<sheet name="${encXml(propre(f.nom))}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join('') + '</sheets></workbook>') });
+    entrees.push({ nom:'xl/_rels/workbook.xml.rels', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      feuilles.map((_, i) => `<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join('') +
+      `<Relationship Id="rId${feuilles.length+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`) });
+    entrees.push({ nom:'xl/styles.xml', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs></styleSheet>') });
+    feuilles.forEach((f, i) => {
+      const gras = new Set(f.gras || []);
+      const cols = f.largeurs && f.largeurs.length ? '<cols>' + f.largeurs.map((w, k) => `<col min="${k+1}" max="${k+1}" width="${w}" customWidth="1"/>`).join('') + '</cols>' : '';
+      const rows = f.lignes.map((l, r) => `<row r="${r+1}">` + (l || []).map((v, c) => {
+        if (v === null || v === undefined || v === '') return '';
+        const ref = colLettres(c) + (r + 1), s = gras.has(r) ? ' s="1"' : '';
+        return typeof v === 'number' && isFinite(v) ? `<c r="${ref}"${s}><v>${v}</v></c>`
+               : `<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${encXml(v)}</t></is></c>`;
+      }).join('') + '</row>').join('');
+      entrees.push({ nom:`xl/worksheets/sheet${i+1}.xml`, data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' + cols + '<sheetData>' + rows + '</sheetData></worksheet>') });
+    });
+    return creerZip(entrees);
+  }
+
+  // ---------- Téléchargement ----------
+  function telecharger(octets, nom, type){
+    const url = URL.createObjectURL(new Blob([octets], { type:type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+    const a = document.createElement('a'); a.href = url; a.download = nom;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+
+  return { lire, modifier, creer, creerZip, telecharger, colLettres, colNum };
+})();
+if (typeof module !== 'undefined') module.exports = MiniXLSX;
+
+    // Petite passerelle : le reste du convertisseur lit les onglets comme avant
+    const XLSX = { utils:{ sheet_to_json:(lignes) => lignes } };
+    </script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+            text-align: center;
+        }
+        
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .drop-zone {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 60px 20px;
+            text-align: center;
+            background: #f8f9ff;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+        }
+        
+        .drop-zone:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+            transform: scale(1.02);
+        }
+        
+        .drop-zone.drag-over {
+            border-color: #764ba2;
+            background: #e8ebff;
+            transform: scale(1.05);
+        }
+        
+        .drop-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+        
+        .drop-text {
+            font-size: 18px;
+            color: #667eea;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+        
+        .drop-hint {
+            font-size: 14px;
+            color: #999;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .progress-container {
+            display: none;
+            margin-top: 30px;
+        }
+        
+        .progress-bar-bg {
+            background: #e0e0e0;
+            border-radius: 10px;
+            height: 30px;
+            overflow: hidden;
+            margin-bottom: 15px;
+        }
+        
+        .progress-bar {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .progress-text {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        
+        .stats {
+            background: #f8f9ff;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+        
+        .stat-label {
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .stat-value {
+            color: #333;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .success-message {
+            background: #4caf50;
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-top: 20px;
+            display: none;
+            animation: slideIn 0.5s ease;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .error-message {
+            background: #f44336;
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .btn-reset {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 20px;
+            width: 100%;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-reset:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .options { background:#f8f9ff; border-radius:10px; padding:14px 16px; margin-bottom:20px; font-size:14px; color:#444; }
+        .options label { display:block; margin:6px 0; cursor:pointer; }
+        .warn { background:#fff7e6; border:1px solid #f5d9a8; color:#7c4a03; border-radius:10px; padding:12px; margin-top:15px; font-size:13px; display:none; text-align:left; }
+        .controle { background:#fdecea; border:2px solid #f44336; color:#611a15; border-radius:10px; padding:16px; margin-top:20px; font-size:14px; text-align:left; display:none; }
+        .controle h2 { font-size:17px; margin-bottom:8px; }
+        .controle ul { margin:8px 0 12px 20px; }
+        .controle li { margin:3px 0; }
+        .controle .boutons { display:flex; gap:10px; flex-wrap:wrap; }
+        .controle button { border:none; border-radius:8px; padding:10px 16px; font-weight:600; cursor:pointer; font-size:14px; }
+        .controle .b-ok { background:#667eea; color:#fff; }
+        .controle .b-force { background:#fff; color:#b42318; border:1px solid #b42318; }
+        .controle-ok { background:#e8f5e9; border:1px solid #81c784; color:#1b5e20; border-radius:10px; padding:10px 14px; margin-top:15px; font-size:13px; display:none; text-align:left; }
+        .bandeau { background:#eef2ff; border:1px solid #c7d0f8; border-left:5px solid #667eea; border-radius:10px; padding:12px 16px; margin-bottom:20px; font-size:13px; color:#333; text-align:left; line-height:1.5; }
+        .bandeau b { color:#4c3a99; }
+        .bandeau ul { margin:6px 0 4px 18px; }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #999;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 Convertisseur FFTir → SIUS</h1>
+        <p class="subtitle">Glissez-déposez votre fichier Excel ou cliquez pour sélectionner</p>
+
+        <div class="bandeau">
+            <b>📥 Fichier à déposer</b> — l'Excel de la compétition créée dans ISIS WEB : onglet <b>« Export &amp; impressions »</b> → ligne <b>SIUS</b> → <b>« Télécharger »</b> (fichier « SIUS - &lt;compétition&gt;.xlsx », anciennement « competition_shots »). Ne pas modifier ses colonnes.
+            <hr style="border:none;border-top:1px solid #c7d0f8;margin:10px 0">
+            <b>🔎 Contrôle automatique du plan de tir</b> — le dossard et le poste sont les deux clés du circuit ISIS WEB ↔ SIUS. Avant de générer les CSV, chaque série est vérifiée :
+            <ul>
+                <li>poste manquant ou non numérique (ex. « ? ») ;</li>
+                <li>deux tireurs sur le même poste ;</li>
+                <li>le même dossard deux fois dans la série.</li>
+            </ul>
+            ✅ Tout est bon → bandeau vert et ZIP généré.<br>
+            ⛔ Erreur → liste des problèmes par série, rien n'est généré : corriger dans ISIS WEB, ré-exporter, recommencer (ou « Générer quand même » pour un cas assumé).<br>
+            💡 Un même tireur peut figurer dans plusieurs séries (plusieurs épreuves). Utiliser toujours l'export ISIS le plus récent, juste avant la compétition, et <b>le conserver</b> : c'est la liste du jour.
+        </div>
+        
+        <div class="options">
+            <b>Format des fichiers CSV :</b>
+            <label><input type="radio" name="fmt" value="win" checked> Windows — pour le PC SIUS (ANSI, fins de ligne Windows, sans BOM) <i>recommandé</i></label>
+            <label><input type="radio" name="fmt" value="utf8"> UTF-8 avec BOM (ancien format, version 1)</label>
+        </div>
+
+        <div class="drop-zone" id="dropZone">
+            <div class="drop-icon">📂</div>
+            <div class="drop-text">Glissez votre fichier Excel ici</div>
+            <div class="drop-hint">ou cliquez pour parcourir</div>
+            <input type="file" id="fileInput" class="file-input" accept=".xlsx,.xls">
+        </div>
+        
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-text" id="progressText">Traitement en cours...</div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar" id="progressBar">0%</div>
+            </div>
+            <div class="stats" id="stats"></div>
+        </div>
+        
+        <div class="success-message" id="successMessage">
+            <h2 style="margin-bottom: 10px;">✅ Export terminé !</h2>
+            <p>Les fichiers CSV ont été téléchargés avec succès</p>
+        </div>
+        
+        <div class="controle" id="controleBox"></div>
+        <div class="controle-ok" id="controleOk"></div>
+        <div class="warn" id="warnBox"></div>
+        <div class="error-message" id="errorMessage"></div>
+        
+        <button class="btn-reset" id="btnReset" style="display: none;">Convertir un autre fichier</button>
+        
+        <div class="footer">
+            Convertisseur FFTir → SIUS v2.2 autonome (fonctionne sans internet) — 07/11/2026 • Compatible Mac, Windows, Linux
+        </div>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const stats = document.getElementById('stats');
+        const successMessage = document.getElementById('successMessage');
+        const errorMessage = document.getElementById('errorMessage');
+        const btnReset = document.getElementById('btnReset');
+
+        // Click sur la drop zone
+        dropZone.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        // Sélection de fichier
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                handleFile(file);
+            }
+        });
+
+        // Drag & Drop
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('drag-over');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('drag-over');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-over');
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                handleFile(file);
+            }
+        });
+
+        // Reset
+        btnReset.addEventListener('click', () => {
+            location.reload();
+        });
+
+        function nettoyer(valeur) {
+            if (valeur === null || valeur === undefined || valeur === '') {
+                return '';
+            }
+            // pas de « ; », de retour à la ligne ni de marque BOM à l'intérieur d'un champ
+            return String(valeur).replace(/\uFEFF/g, '').replace(/[;\r\n]+/g, ' ').trim();
+        }
+
+        // Texte → octets Windows-1252 (« ANSI » de Windows) : é è ç ô ë… sont codés sur 1 octet
+        const CP1252 = { '€':0x80,'‚':0x82,'ƒ':0x83,'„':0x84,'…':0x85,'†':0x86,'‡':0x87,'ˆ':0x88,'‰':0x89,'Š':0x8A,'‹':0x8B,'Œ':0x8C,'Ž':0x8E,
+            '‘':0x91,'’':0x92,'“':0x93,'”':0x94,'•':0x95,'–':0x96,'—':0x97,'˜':0x98,'™':0x99,'š':0x9A,'›':0x9B,'œ':0x9C,'ž':0x9E,'Ÿ':0x9F };
+        function enAnsi(texte) {
+            const octets = [];
+            for (const c of texte) {
+                const code = c.codePointAt(0);
+                if (code < 0x80 || (code >= 0xA0 && code <= 0xFF)) octets.push(code);
+                else if (CP1252[c] !== undefined) octets.push(CP1252[c]);
+                else octets.push(0x3F);   // caractère inconnu de Windows → « ? »
+            }
+            return new Uint8Array(octets);
+        }
+
+        const esc = t => String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+        // Contrôle du plan de tir, onglet par onglet (une série = un onglet) :
+        //  - n° de poste manquant ou non numérique
+        //  - deux tireurs sur le même poste dans la série
+        //  - même dossard deux fois dans la série
+        function controlerPlan(workbook) {
+            const erreurs = [];
+            let nbTireurs = 0, nbSeries = 0;
+            for (const sheetName of workbook.SheetNames) {
+                const lignes = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1 });
+                const parPoste = new Map(), parDossard = new Map();
+                let n = 0;
+                for (let row = 1; row < lignes.length; row++) {
+                    const r = lignes[row];
+                    if (!r || !r[0]) continue;
+                    n++;
+                    const dossard = nettoyer(r[0]), qui = `${nettoyer(r[1])} ${nettoyer(r[2])} (dossard ${dossard})`;
+                    const poste = nettoyer(r[6]);
+                    if (!poste) erreurs.push({ serie: sheetName, texte: `${qui} : <b>aucun n° de poste</b>` });
+                    else if (!/^\d+$/.test(poste)) erreurs.push({ serie: sheetName, texte: `${qui} : n° de poste <b>« ${esc(poste)} »</b> non numérique` });
+                    else {
+                        if (!parPoste.has(poste)) parPoste.set(poste, []);
+                        parPoste.get(poste).push(qui);
+                    }
+                    if (!parDossard.has(dossard)) parDossard.set(dossard, []);
+                    parDossard.get(dossard).push(`${nettoyer(r[1])} ${nettoyer(r[2])}`);
+                }
+                if (n) { nbSeries++; nbTireurs += n; }
+                for (const [poste, qui] of parPoste) if (qui.length > 1)
+                    erreurs.push({ serie: sheetName, texte: `<b>poste ${esc(poste)} attribué ${qui.length} fois</b> : ${qui.map(esc).join(' / ')}` });
+                for (const [dossard, qui] of parDossard) if (qui.length > 1)
+                    erreurs.push({ serie: sheetName, texte: `<b>dossard ${esc(dossard)} présent ${qui.length} fois</b> : ${qui.map(esc).join(' / ')}` });
+            }
+            return { erreurs, nbTireurs, nbSeries };
+        }
+
+        async function handleFile(file) {
+            let workbook;
+            try {
+                dropZone.style.display = 'none';
+                const data = await file.arrayBuffer();
+                workbook = await MiniXLSX.lire(data);
+            } catch (error) {
+                console.error(error);
+                errorMessage.textContent = '❌ Erreur de lecture : ' + error.message;
+                errorMessage.style.display = 'block';
+                btnReset.style.display = 'block';
+                return;
+            }
+            const ctrl = controlerPlan(workbook);
+            if (ctrl.erreurs.length) {
+                const box = document.getElementById('controleBox');
+                const parSerie = new Map();
+                ctrl.erreurs.forEach(e => { if (!parSerie.has(e.serie)) parSerie.set(e.serie, []); parSerie.get(e.serie).push(e.texte); });
+                box.innerHTML = `<h2>⛔ Plan de tir à corriger avant de charger SIUS</h2>
+                    <div>${ctrl.erreurs.length} problème(s) trouvé(s). Corrige-les dans ISIS WEB, ré-exporte le fichier, puis recommence.</div>
+                    ${[...parSerie].map(([serie, l]) => `<div style="margin-top:10px"><b>${esc(serie)}</b><ul>${l.map(t => '<li>' + t + '</li>').join('')}</ul></div>`).join('')}
+                    <div class="boutons">
+                        <button class="b-ok" id="btnCorriger">Corriger et recommencer</button>
+                        <button class="b-force" id="btnForcer">Générer quand même</button>
+                    </div>`;
+                box.style.display = 'block';
+                document.getElementById('btnCorriger').onclick = () => location.reload();
+                document.getElementById('btnForcer').onclick = () => {
+                    if (!confirm('Générer les fichiers SIUS malgré les erreurs de postes / dossards ?\nLes tirs risquent d’être attribués aux mauvais tireurs.')) return;
+                    box.style.display = 'none';
+                    generer(workbook, ctrl);
+                };
+                return;
+            }
+            generer(workbook, ctrl);
+        }
+
+        async function generer(workbook, ctrl) {
+            try {
+                progressContainer.style.display = 'block';
+                if (!ctrl.erreurs.length) {
+                    const ok = document.getElementById('controleOk');
+                    ok.innerHTML = `✅ Plan de tir contrôlé : ${ctrl.nbSeries} série(s), ${ctrl.nbTireurs} tireur(s) — aucun poste ni dossard en double, tous les postes sont renseignés.`;
+                    ok.style.display = 'block';
+                }
+                
+                const totalSheets = workbook.SheetNames.length;
+                let processedSheets = 0;
+                let createdFiles = 0;
+                
+                // Créer un ZIP pour tous les CSV
+                const zipFichiers = [];
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                const windows = document.querySelector('input[name=fmt]:checked').value === 'win';
+                const finLigne = windows ? '\r\n' : '\n';
+                const sansPoste = [];
+                
+                // Traiter chaque onglet
+                for (let i = 0; i < workbook.SheetNames.length; i++) {
+                    const sheetName = workbook.SheetNames[i];
+                    const worksheet = workbook.Sheets[sheetName];
+                    
+                    // Mettre à jour la progression
+                    const percent = Math.round(((i + 1) / totalSheets) * 100);
+                    progressBar.style.width = percent + '%';
+                    progressBar.textContent = percent + '%';
+                    progressText.textContent = `Traitement : ${sheetName} (${i + 1}/${totalSheets})`;
+                    
+                    // Convertir en JSON
+                    const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+                    
+                    // Ignorer les feuilles vides
+                    if (jsonData.length < 2 || !jsonData[1] || !jsonData[1][0]) {
+                        processedSheets++;
+                        continue;
+                    }
+                    
+                    // Créer le CSV
+                    let csvContent = '';
+                    
+                    // Parcourir les lignes (ignorer l'en-tête ligne 0)
+                    for (let row = 1; row < jsonData.length; row++) {
+                        const rowData = jsonData[row];
+                        
+                        if (!rowData || !rowData[0]) continue;
+                        
+                        const startNumber = nettoyer(rowData[0]);
+                        const name = nettoyer(rowData[1]);
+                        const firstName = nettoyer(rowData[2]);
+                        const nation = nettoyer(rowData[3]);
+                        const team = nettoyer(rowData[4]);
+                        const groups = nettoyer(rowData[5]);
+                        const targetNumber = nettoyer(rowData[6]);
+                        
+                        // Format SIUS (17 colonnes)
+                        const ligne = [
+                            startNumber,                    // Col 1
+                            startNumber,                    // Col 2
+                            name,                           // Col 3
+                            firstName,                      // Col 4
+                            `${name} ${firstName}`,         // Col 5
+                            nation,                         // Col 6
+                            groups,                         // Col 7
+                            '',                             // Col 8
+                            team,                           // Col 9
+                            '',                             // Col 10
+                            targetNumber,                   // Col 11
+                            '1',                            // Col 12
+                            '',                             // Col 13
+                            '0',                            // Col 14
+                            '1',                            // Col 15
+                            '0',                            // Col 16
+                            '0'                             // Col 17
+                        ];
+                        
+                        csvContent += ligne.join(';') + finLigne;
+                        if (!targetNumber) sansPoste.push(sheetName + ' : ' + name + ' ' + firstName);
+                    }
+                    
+                    // Ajouter au ZIP
+                    if (csvContent) {
+                        // Simplifier le nom du fichier
+                        let fileName = sheetName;
+                        
+                        // Extraire le numéro de série (S1, S2, etc.)
+                        const serieMatch = fileName.match(/^S\d+/);
+                        const serieNum = serieMatch ? serieMatch[0] : 'Serie';
+                        
+                        // Extraire et simplifier le type d'épreuve
+                        let epreuve = fileName.replace(/^S\d+\s*-?\s*/i, '').toLowerCase();
+                        epreuve = epreuve.replace(/\s*10\s*m/gi, ''); // Retirer "10 m"
+                        epreuve = epreuve.replace(/\s*match\s*/gi, '_match'); // Garder "match"
+                        epreuve = epreuve.replace(/\s*field\s*/gi, '_field'); // Garder "field"
+                        epreuve = epreuve.replace(/\s*mixte\s*/gi, '_mixte'); // Garder "mixte"
+                        epreuve = epreuve.replace(/\s+/g, '_'); // Espaces → underscore
+                        epreuve = epreuve.replace(/[\/\\:*?"<>|]/g, ''); // Retirer caractères spéciaux
+                        epreuve = epreuve.replace(/_+/g, '_'); // Nettoyer doubles underscores
+                        epreuve = epreuve.replace(/^_|_$/g, ''); // Retirer underscores début/fin
+                        
+                        // Si pas d'épreuve détectée, utiliser le nom original simplifié
+                        if (!epreuve) {
+                            epreuve = fileName.replace(/[\/\\:*?"<>|]/g, '_');
+                        }
+                        
+                        fileName = `${serieNum}_${epreuve}.csv`;
+                        
+                        if (windows) {
+                            // Format Windows : ANSI (Windows-1252), CRLF, SANS BOM (le BOM collait « ï»¿ » devant le 1er n° de départ)
+                            zipFichiers.push({ nom: fileName, data: enAnsi(csvContent) });
+                        } else {
+                            zipFichiers.push({ nom: fileName, data: new TextEncoder().encode('\uFEFF' + csvContent) });   // ancien format : UTF-8 avec BOM
+                        }
+                        createdFiles++;
+                    }
+                    
+                    processedSheets++;
+                }
+                
+                // Afficher les stats
+                stats.innerHTML = `
+                    <div class="stat-row">
+                        <span class="stat-label">Onglets analysés</span>
+                        <span class="stat-value">${totalSheets}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Onglets traités</span>
+                        <span class="stat-value">${processedSheets}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Fichiers CSV créés</span>
+                        <span class="stat-value">${createdFiles}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Format</span>
+                        <span class="stat-value">${windows ? 'Windows (ANSI, CRLF)' : 'UTF-8 avec BOM'}</span>
+                    </div>
+                `;
+                if (sansPoste.length) {
+                    const w = document.getElementById('warnBox');
+                    w.innerHTML = '⚠️ <b>' + sansPoste.length + ' tireur(s) sans n° de poste</b> (colonne 11 vide) :<br>' +
+                        sansPoste.map(x => x.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))).join('<br>');
+                    w.style.display = 'block';
+                }
+                
+                // Générer et télécharger le ZIP
+                progressText.textContent = 'Création du fichier ZIP...';
+                MiniXLSX.telecharger(MiniXLSX.creerZip(zipFichiers), `Export_SIUS_${timestamp}.zip`, 'application/zip');
+                
+                // Afficher le succès
+                stats.style.display = 'block';
+                document.getElementById('progressText').textContent = '';
+                document.querySelector('.progress-bar-bg').style.display = 'none';
+                successMessage.style.display = 'block';
+                btnReset.style.display = 'block';
+                
+            } catch (error) {
+                console.error(error);
+                progressContainer.style.display = 'none';
+                errorMessage.textContent = '❌ Erreur : ' + error.message;
+                errorMessage.style.display = 'block';
+                btnReset.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<!-- SIUS vers ISIS WEB — v1.0 autonome — 07/11/2026 : fonctionne sans internet (aucune bibliothèque externe) -->
+<html lang="fr">
+<head>
+<script>
+/* Accès réservé : renvoie vers la page d'accueil des outils si le mot de passe n'a pas été saisi (sauf en local). */
+try { if (location.protocol !== 'file:' && sessionStorage.getItem('outilsLR') !== 'ok')
+  location.replace('index.html?retour=' + encodeURIComponent(location.pathname.split('/').pop())); } catch(e){}
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIUS vers ISIS WEB (autonome)</title>
+<script>
+/* ===== MiniXLSX — lecture / écriture Excel (.xlsx) et ZIP sans aucune dépendance ni connexion =====
+   Utilise uniquement les fonctions intégrées aux navigateurs récents (DecompressionStream). */
+const MiniXLSX = (() => {
+  const te = new TextEncoder(), td = new TextDecoder('utf-8');
+
+  // ---------- CRC32 ----------
+  const TABLE = new Uint32Array(256);
+  for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; TABLE[n] = c >>> 0; }
+  const crc32 = d => { let c = 0xFFFFFFFF; for (let i = 0; i < d.length; i++) c = TABLE[(c ^ d[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+
+  // ---------- Lecture ZIP ----------
+  async function inflate(data){
+    const flux = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(flux).arrayBuffer());
+  }
+  async function lireZip(buf){
+    const u = new Uint8Array(buf), v = new DataView(u.buffer, u.byteOffset, u.byteLength);
+    let e = u.length - 22;
+    while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;
+    if (e < 0) throw new Error('fichier non reconnu (ce n’est pas un fichier Excel .xlsx)');
+    const nb = v.getUint16(e + 10, true); let p = v.getUint32(e + 16, true);
+    const fichiers = new Map();
+    for (let i = 0; i < nb; i++){
+      if (v.getUint32(p, true) !== 0x02014b50) throw new Error('fichier Excel endommagé');
+      const methode = v.getUint16(p + 10, true), taille = v.getUint32(p + 20, true);
+      const ln = v.getUint16(p + 28, true), lx = v.getUint16(p + 30, true), lc = v.getUint16(p + 32, true);
+      const local = v.getUint32(p + 42, true);
+      const nom = td.decode(u.subarray(p + 46, p + 46 + ln));
+      const debut = local + 30 + v.getUint16(local + 26, true) + v.getUint16(local + 28, true);
+      const brut = u.subarray(debut, debut + taille);
+      fichiers.set(nom, methode === 0 ? brut.slice() : methode === 8 ? await inflate(brut) : null);
+      p += 46 + ln + lx + lc;
+    }
+    return fichiers;
+  }
+
+  // ---------- Écriture ZIP (sans compression, accepté par Excel / LibreOffice / ISIS WEB) ----------
+  function creerZip(entrees){   // [{nom, data:Uint8Array}]
+    const d = new Date();
+    const heure = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    const morceaux = [], central = []; let pos = 0;
+    for (const { nom, data } of entrees){
+      const n = te.encode(nom), crc = crc32(data);
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+      h.setUint16(10, heure, true); h.setUint16(12, date, true); h.setUint32(14, crc, true);
+      h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, n.length, true); h.setUint16(28, 0, true);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true);
+      c.setUint16(12, heure, true); c.setUint16(14, date, true); c.setUint32(16, crc, true);
+      c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, n.length, true);
+      c.setUint32(42, pos, true);
+      morceaux.push(new Uint8Array(h.buffer), n, data);
+      central.push(new Uint8Array(c.buffer), n);
+      pos += 30 + n.length + data.length;
+    }
+    const tailleCentral = central.reduce((a, x) => a + x.length, 0);
+    const fin = new DataView(new ArrayBuffer(22));
+    fin.setUint32(0, 0x06054b50, true); fin.setUint16(8, entrees.length, true); fin.setUint16(10, entrees.length, true);
+    fin.setUint32(12, tailleCentral, true); fin.setUint32(16, pos, true);
+    const tout = [...morceaux, ...central, new Uint8Array(fin.buffer)];
+    const out = new Uint8Array(tout.reduce((a, x) => a + x.length, 0)); let o = 0;
+    for (const x of tout){ out.set(x, o); o += x.length; }
+    return out;
+  }
+
+  // ---------- Outils XML ----------
+  const decXml = s => s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (m, e) =>
+    e === 'amp' ? '&' : e === 'lt' ? '<' : e === 'gt' ? '>' : e === 'quot' ? '"' : e === 'apos' ? "'" :
+    e[1] === 'x' ? String.fromCodePoint(parseInt(e.slice(2), 16)) : String.fromCodePoint(parseInt(e.slice(1), 10)));
+  const encXml = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]))
+                               .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  const attr = (a, n) => { const m = new RegExp('(?:^|\\s)' + n + '="([^"]*)"').exec(a); return m ? decXml(m[1]) : null; };
+  const texteDe = x => { let t = ''; x.replace(/<rPh\b[\s\S]*?<\/rPh>/g, '').replace(/<t\b[^>]*>([\s\S]*?)<\/t>/g, (m, a) => { t += a; return m; }); return decXml(t); };
+  const colNum = lettres => { let n = 0; for (const ch of lettres) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+  const colLettres = n => { let s = ''; n++; while (n > 0){ const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
+  const RE_CELL = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g, RE_ROW = /<row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/row>)/g;
+
+  // ---------- Lecture d'un classeur ----------
+  // Renvoie { SheetNames:[...], Sheets:{ nom: lignes[][] }, chemins:{ nom: 'xl/worksheets/sheet1.xml' }, fichiers }
+  // lignes[0] = ligne 1 d'Excel ; cellule vide = null ; nombres en Number, textes en String.
+  async function lire(buf){
+    const f = await lireZip(buf);
+    const txt = n => f.has(n) ? td.decode(f.get(n)) : null;
+    const wbx = txt('xl/workbook.xml'); if (!wbx) throw new Error('fichier Excel non reconnu (workbook absent)');
+    const rels = {}; (txt('xl/_rels/workbook.xml.rels') || '').replace(/<Relationship\b([^>]*?)\/?>/g, (m, a) => { rels[attr(a, 'Id')] = attr(a, 'Target'); return m; });
+    const partages = []; (txt('xl/sharedStrings.xml') || '').replace(/<si\b[^>]*>([\s\S]*?)<\/si>/g, (m, x) => { partages.push(texteDe(x)); return m; });
+    const wb = { SheetNames:[], Sheets:{}, chemins:{}, fichiers:f };
+    const feuilles = []; wbx.replace(/<sheet\b([^>]*?)\/?>/g, (m, a) => { feuilles.push(a); return m; });
+    for (const a of feuilles){
+      const nom = attr(a, 'name'), rid = attr(a, 'r:id');
+      let cible = rels[rid] || ''; cible = cible.startsWith('/') ? cible.slice(1) : 'xl/' + cible.replace(/^\.\//, '');
+      const xml = txt(cible); if (xml === null) continue;
+      const lignes = []; let numLigne = 0;
+      xml.replace(RE_ROW, (m, ra, contenu) => {
+        const r = attr(ra, 'r'); numLigne = r ? +r : numLigne + 1;
+        const ligne = []; let col = -1;
+        (contenu || '').replace(RE_CELL, (mc, ca, cc) => {
+          const ref = attr(ca, 'r'); col = ref ? colNum(ref.replace(/\d+/g, '')) : col + 1;
+          const t = attr(ca, 't'); let val = null; cc = cc || '';
+          const vm = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(cc);
+          if (t === 's') val = vm ? (partages[+vm[1]] ?? '') : null;
+          else if (t === 'inlineStr') val = texteDe(cc);
+          else if (t === 'str' || t === 'e') val = vm ? decXml(vm[1]) : null;
+          else if (t === 'b') val = vm ? vm[1] === '1' : null;
+          else if (vm){ const n = Number(vm[1]); val = isNaN(n) ? decXml(vm[1]) : n; }
+          if (val === '') val = null;
+          while (ligne.length < col) ligne.push(null);
+          ligne[col] = val;
+          return mc;
+        });
+        while (lignes.length < numLigne - 1) lignes.push([]);
+        lignes[numLigne - 1] = ligne;
+        return m;
+      });
+      wb.SheetNames.push(nom); wb.Sheets[nom] = lignes; wb.chemins[nom] = cible;
+    }
+    return wb;
+  }
+
+  // ---------- Modification de cellules dans un classeur existant (mise en forme conservée) ----------
+  // ecritures : [{ feuille, ligne (0 = ligne 1), colonne (0 = A), valeur (nombre ou texte) }]
+  function modifier(wb, ecritures){
+    const parFeuille = new Map();
+    for (const e of ecritures){ if (!parFeuille.has(e.feuille)) parFeuille.set(e.feuille, []); parFeuille.get(e.feuille).push(e); }
+    const nouveaux = new Map();
+    for (const [feuille, liste] of parFeuille){
+      const chemin = wb.chemins[feuille]; if (!chemin) throw new Error('onglet introuvable : ' + feuille);
+      let xml = td.decode(wb.fichiers.get(chemin));
+      const parLigne = new Map();
+      for (const e of liste){ const r = e.ligne + 1; if (!parLigne.has(r)) parLigne.set(r, new Map()); parLigne.get(r).set(e.colonne, e.valeur); }
+      const celluleXml = (r, c, v, style) => {
+        const ref = colLettres(c) + r, s = style ? ` s="${style}"` : '';
+        if (v === null || v === undefined || v === '') return `<c r="${ref}"${s}/>`;
+        return typeof v === 'number' ? `<c r="${ref}"${s}><v>${v}</v></c>`
+                                     : `<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${encXml(v)}</t></is></c>`;
+      };
+      const reconstruire = (r, attrs, contenu, modifs) => {
+        const cellules = new Map(); let col = -1;
+        (contenu || '').replace(RE_CELL, (mc, ca) => {
+          const ref = attr(ca, 'r'); col = ref ? colNum(ref.replace(/\d+/g, '')) : col + 1;
+          cellules.set(col, { xml:mc, style:attr(ca, 's') }); return mc;
+        });
+        for (const [c, v] of modifs) cellules.set(c, { xml:celluleXml(r, c, v, cellules.get(c)?.style) });
+        const tri = [...cellules.entries()].sort((a, b) => a[0] - b[0]).map(x => x[1].xml).join('');
+        return `<row${attrs}>${tri}</row>`;
+      };
+      if (/<sheetData\s*\/>/.test(xml)) xml = xml.replace(/<sheetData\s*\/>/, '<sheetData></sheetData>');
+      const vues = new Set(); let numLigne = 0;
+      xml = xml.replace(/<sheetData>([\s\S]*?)<\/sheetData>/, (m, contenu) => {
+        let res = contenu.replace(RE_ROW, (mr, ra, rc) => {
+          const r0 = attr(ra, 'r'); numLigne = r0 ? +r0 : numLigne + 1;
+          const modifs = parLigne.get(numLigne); if (!modifs) return mr;
+          vues.add(numLigne);
+          const attrs = r0 ? ra : ra + ` r="${numLigne}"`;
+          return reconstruire(numLigne, attrs, rc, modifs);
+        });
+        // lignes absentes du fichier : ajoutées dans l'ordre
+        const manquantes = [...parLigne.keys()].filter(r => !vues.has(r)).sort((a, b) => a - b);
+        for (const r of manquantes){
+          const nouvelle = reconstruire(r, ` r="${r}"`, '', parLigne.get(r));
+          let insere = false;
+          res = res.replace(RE_ROW, (mr, ra) => { if (!insere && +(attr(ra, 'r') || 0) > r){ insere = true; return nouvelle + mr; } return mr; });
+          if (!insere) res += nouvelle;
+        }
+        return `<sheetData>${res}</sheetData>`;
+      });
+      nouveaux.set(chemin, te.encode(xml));
+    }
+    const entrees = [];
+    for (const [nom, data] of wb.fichiers){
+      if (nom === 'xl/calcChain.xml' || data === null) continue;
+      let d = nouveaux.get(nom) || data;
+      if (nom === '[Content_Types].xml') d = te.encode(td.decode(d).replace(/<Override\b[^>]*calcChain[^>]*\/>/g, ''));
+      if (nom === 'xl/_rels/workbook.xml.rels') d = te.encode(td.decode(d).replace(/<Relationship\b[^>]*calcChain[^>]*\/>/g, ''));
+      entrees.push({ nom, data:d });
+    }
+    return creerZip(entrees);
+  }
+
+  // ---------- Création d'un classeur neuf ----------
+  // feuilles : [{ nom, lignes:[[...]], largeurs:[nb caractères...], gras:[n° de lignes (0 = 1re) en gras] }]
+  function creer(feuilles){
+    const propre = n => String(n).replace(/[\[\]:*?\/\\]/g, '-').slice(0, 31) || 'Feuille';
+    const entrees = [];
+    const ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+      '<Default Extension="xml" ContentType="application/xml"/>',
+      '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+      '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+      ...feuilles.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`),
+      '</Types>'].join('');
+    entrees.push({ nom:'[Content_Types].xml', data:te.encode(ct) });
+    entrees.push({ nom:'_rels/.rels', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>') });
+    entrees.push({ nom:'xl/workbook.xml', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+      feuilles.map((f, i) => `<sheet name="${encXml(propre(f.nom))}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join('') + '</sheets></workbook>') });
+    entrees.push({ nom:'xl/_rels/workbook.xml.rels', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      feuilles.map((_, i) => `<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join('') +
+      `<Relationship Id="rId${feuilles.length+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`) });
+    entrees.push({ nom:'xl/styles.xml', data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs></styleSheet>') });
+    feuilles.forEach((f, i) => {
+      const gras = new Set(f.gras || []);
+      const cols = f.largeurs && f.largeurs.length ? '<cols>' + f.largeurs.map((w, k) => `<col min="${k+1}" max="${k+1}" width="${w}" customWidth="1"/>`).join('') + '</cols>' : '';
+      const rows = f.lignes.map((l, r) => `<row r="${r+1}">` + (l || []).map((v, c) => {
+        if (v === null || v === undefined || v === '') return '';
+        const ref = colLettres(c) + (r + 1), s = gras.has(r) ? ' s="1"' : '';
+        return typeof v === 'number' && isFinite(v) ? `<c r="${ref}"${s}><v>${v}</v></c>`
+               : `<c r="${ref}"${s} t="inlineStr"><is><t xml:space="preserve">${encXml(v)}</t></is></c>`;
+      }).join('') + '</row>').join('');
+      entrees.push({ nom:`xl/worksheets/sheet${i+1}.xml`, data:te.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' + cols + '<sheetData>' + rows + '</sheetData></worksheet>') });
+    });
+    return creerZip(entrees);
+  }
+
+  // ---------- Téléchargement ----------
+  function telecharger(octets, nom, type){
+    const url = URL.createObjectURL(new Blob([octets], { type:type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+    const a = document.createElement('a'); a.href = url; a.download = nom;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+
+  return { lire, modifier, creer, creerZip, telecharger, colLettres, colNum };
+})();
+if (typeof module !== 'undefined') module.exports = MiniXLSX;
+</script>
+<style>
+  :root{
+    --bleu:#1F3864; --bleu2:#2E5597; --fond:#F4F6FA; --carte:#fff; --bord:#D9DFEA;
+    --texte:#1B2330; --gris:#5E6B80; --ok:#1E7B4A; --alerte:#B45309; --erreur:#B42318;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--fond);color:var(--texte);font-size:15px}
+  header{background:var(--bleu);color:#fff;padding:22px 28px}
+  header h1{margin:0;font-size:22px;font-weight:650}
+  header p{margin:6px 0 0;opacity:.8;font-size:14px}
+  main{max-width:1250px;margin:0 auto;padding:24px 20px 60px}
+  details.mode{background:var(--carte);border:1px solid var(--bord);border-left:4px solid var(--ok);border-radius:12px;padding:12px 18px;margin-bottom:18px;font-size:14px;line-height:1.5}
+  details.mode summary{cursor:pointer;font-weight:650;color:var(--bleu);font-size:15px}
+  details.mode ol{margin:10px 0 6px;padding-left:22px}
+  details.mode li{margin:6px 0}
+  details.mode .att{background:#FFF7E8;border:1px solid #F3D19C;border-radius:8px;padding:8px 12px;margin-top:10px}
+  .depots{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:760px){.depots{grid-template-columns:1fr}}
+  .zone{background:var(--carte);border:2px dashed var(--bord);border-radius:12px;padding:22px;text-align:center;cursor:pointer;transition:.15s}
+  .zone:hover,.zone.survol{border-color:var(--bleu2);background:#EEF3FB}
+  .zone.chargee{border-style:solid;border-color:var(--ok)}
+  .zone h2{margin:0 0 6px;font-size:16px;color:var(--bleu)}
+  .zone .aide{color:var(--gris);font-size:13px}
+  .zone .fichiers{margin-top:10px;font-size:13px;color:var(--ok);font-weight:600;word-break:break-all}
+  .zone input{display:none}
+  .actions{display:flex;gap:12px;align-items:center;margin:20px 0;flex-wrap:wrap}
+  button{font:inherit;border:0;border-radius:8px;padding:11px 20px;cursor:pointer;font-weight:600}
+  .principal{background:var(--bleu);color:#fff}
+  .principal:disabled{background:#9AA6BA;cursor:not-allowed}
+  .secondaire{background:#fff;color:var(--bleu);border:1px solid var(--bord)}
+  .etat{color:var(--gris);font-size:14px}
+  .bilan{background:var(--carte);border:1px solid var(--bord);border-radius:12px;padding:14px 18px;margin-bottom:16px;font-size:14px}
+  .bilan b{color:var(--bleu)}
+  .alertes{background:#FFF7E8;border:1px solid #F3D19C;border-radius:12px;padding:12px 18px;margin-bottom:16px;font-size:14px}
+  .alertes h3{margin:0 0 6px;font-size:14px;color:var(--alerte)}
+  .alertes ul{margin:0;padding-left:18px}
+  .alertes li{margin:3px 0}
+  .discipline{background:var(--carte);border:1px solid var(--bord);border-radius:12px;margin-bottom:18px;overflow:hidden}
+  .discipline h3{margin:0;padding:12px 18px;background:#E9EEF7;color:var(--bleu);font-size:15px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .discipline h3 span{font-weight:400;color:var(--gris);font-size:13px}
+  .defile{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th{background:var(--bleu);color:#fff;font-weight:600;padding:7px 8px;text-align:center;white-space:nowrap}
+  th.g,td.g{text-align:left}
+  td{padding:6px 8px;border-bottom:1px solid #EDF0F5;text-align:center;white-space:nowrap}
+  tr:nth-child(even) td{background:#FAFBFD}
+  td.tot{font-weight:700;color:var(--bleu)}
+  td .dec{display:block;font-size:11.5px;color:var(--gris)}
+  th.info{background:#5E6B80}
+  td.info{color:var(--gris);font-size:12.5px}
+  td.rem{white-space:normal;text-align:left;font-size:12px;color:var(--alerte);min-width:180px}
+  .rang{font-weight:700;color:var(--gris)}
+  .absents{padding:8px 18px 12px;font-size:12.5px;color:var(--gris)}
+  .cache{display:none}
+  footer{text-align:center;color:var(--gris);font-size:12px;margin-top:30px}
+</style>
+</head>
+<body>
+<a href="index.html" style="position:fixed;top:10px;left:12px;z-index:99;background:#fff;color:#1F3864;border:1px solid #D9DFEA;border-radius:8px;padding:6px 12px;font:600 13px system-ui,sans-serif;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,.12)">← Outils</a>
+
+<header>
+  <h1>SIUS vers ISIS WEB</h1>
+  <p>Transforme les tirs enregistrés par les cibles électroniques SIUS en fichier « saisie hors ligne » à réimporter dans ISIS WEB.</p>
+</header>
+
+<main>
+  <details class="mode" open>
+    <summary>📋 Mode d’emploi — de SIUS à ISIS WEB, série après série</summary>
+    <ol>
+      <li><b>Avant la compétition :</b> une fois séries et postes figés dans ISIS WEB, exporter la liste de départ (« SIUS - &lt;compétition&gt;.xlsx »), la charger dans SIUS et <b>la garder</b> (liste du jour).</li>
+      <li><b>Après chaque série horaire :</b> exporter le CSV des tirs depuis SIUS et le ranger dans le dossier de la compétition (Serie01.csv, Serie02.csv…). Ne pas supprimer les précédents.</li>
+      <li><b>ISIS WEB :</b> onglet Résultats → « Exporter saisie hors ligne ». Un seul export suffit tant que le plan de tir ne change pas (refaire l’export après tout ajout de tireur ou changement de poste).</li>
+      <li><b>Cette page :</b> zone 1 → déposer <b>tous</b> les CSV déjà récupérés (les doublons sont ignorés) ; zone 2 → la saisie hors ligne + la liste du jour. Cliquer « Reconstituer les matchs ».</li>
+      <li><b>Contrôler :</b> aucune alerte rouge, lire les points à vérifier (coup hors programme, série incomplète, rattachement « à vérifier »), coup d’œil aux podiums.</li>
+      <li><b>Importer :</b> « Générer le fichier pour ISIS WEB », puis dans ISIS WEB « Importer saisie hors ligne » → fichier <i>…_rempli.xlsx</i> → valider. Vérifier le badge vert.</li>
+    </ol>
+    <div class="att">⚠️ <b>Alerte rouge = ne rien importer</b> : les fichiers ne viennent pas de la même compétition, ou les dossards ont changé sans que la liste du jour soit chargée.<br>
+    💡 Recharger tous les CSV à chaque fois : le fichier généré contient alors toutes les séries déjà tirées, rien n’est perdu à l’import.<br>
+    🧪 Au premier usage, faire un import d’essai après la 1<sup>re</sup> série et vérifier dans ISIS WEB que les autres tireurs ne sont pas effacés.</div>
+  </details>
+
+  <div class="depots">
+    <label class="zone" id="zoneSius">
+      <h2>1 · Export SIUS (.csv)</h2>
+      <div class="aide">Glisser-déposer ou cliquer — plusieurs fichiers acceptés (un par série horaire)</div>
+      <div class="fichiers" id="nomSius"></div>
+      <input type="file" id="fichierSius" accept=".csv,.txt" multiple>
+    </label>
+    <label class="zone" id="zoneIsis">
+      <h2>2 · Fichier ISIS WEB (.xlsx)</h2>
+      <div class="aide"><b>« Saisie hors ligne »</b> (Résultats → Exporter saisie hors ligne) pour obtenir le fichier à réimporter. Si les dossards ont changé depuis le match, ajoute aussi la <b>liste de départ chargée dans SIUS ce jour-là</b> (« SIUS - ….xlsx » / « competition_shots ») : les tireurs seront retrouvés par leur nom.</div>
+      <div class="fichiers" id="nomIsis"></div>
+      <input type="file" id="fichierIsis" accept=".xlsx,.xls,.csv" multiple>
+    </label>
+  </div>
+
+  <div class="actions">
+    <button class="principal" id="btnCalcul" disabled>Reconstituer les matchs</button>
+    <button class="principal cache" id="btnIsis" style="background:#1E7B4A">Générer le fichier pour ISIS WEB</button>
+    <button class="principal cache" id="btnExport">Télécharger le récapitulatif Excel</button>
+    <button class="secondaire" id="btnRaz">Recommencer</button>
+    <span class="etat" id="etat">Charge les deux fichiers pour commencer.</span>
+  </div>
+
+  <div id="resultats"></div>
+  <footer>SIUS vers ISIS WEB — v1.0 autonome (fonctionne sans internet) — 07/11/2026<br>Lecture du CSV SIUS : coups de match uniquement (essais écartés) · carabine : classement au dixième (3x20 : points entiers) · pistolet : classement en points entiers · l'autre valeur est donnée pour info · coup marqué « hors programme » par SIUS exclu.</footer>
+</main>
+
+<!-- ===================== Moteur de calcul (sans DOM) ===================== -->
+<script id="moteur">
+const SIUS = {
+  // Colonnes de l'export SIUS (index à partir de 0)
+  C: { DOSSARD:0, VALEUR:1, MATCH:2, CIBLE:3, DECIMAL:4, HEURE:6, MOUCHE:7, MODE:14, STATUT:16, SERIE:18, NUMTIR:20, ID:22, COMPTAGE:26 },
+
+  lireCsv(texte, nomFichier){
+    const lignes = texte.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const coups = [];
+    for (const l of lignes){
+      const c = l.split(';');
+      if (c.length < 21 || !/^\d+$/.test(c[0].trim())) continue;
+      coups.push({ cols:c, fichier:nomFichier });
+    }
+    return coups;
+  },
+
+  // isis : [{ nom:'S1 - CARABINE...', tireurs:[{dossard,nom,prenom,nation,club,cat,cible}] }]
+  lireIsisDepuisLignes(nomOnglet, lignes){
+    let iEntete = lignes.findIndex(r => r && String(r[0]||'').toLowerCase().includes('start'));
+    const tireurs = [];
+    for (let i = iEntete + 1; i < lignes.length; i++){
+      const r = lignes[i]; if (!r || r[0] === undefined || r[0] === null || r[0] === '') continue;
+      const d = String(r[0]).trim(); if (!/^\d+$/.test(d)) continue;
+      tireurs.push({ dossard:d, nom:String(r[1]||'').trim(), prenom:String(r[2]||'').trim(), nation:String(r[3]||'').trim(),
+        club:String(r[4]||'').trim(), cat:String(r[5]||'').trim(), cible: r[6]==null ? '' : String(r[6]).trim() });
+    }
+    return { nom:nomOnglet, tireurs };
+  },
+
+  // Fichier « Saisie hors ligne » d'ISIS WEB : en-tête ID / Epr. / ... / N°dossard / Série 1..14
+  // Renvoie null si ce n'est pas ce format, sinon des onglets virtuels (feuille + épreuve) avec la position de chaque ligne.
+  lireSaisieHorsLigne(nomFeuille, lignes, ligneDepart){
+    const iEntete = lignes.findIndex(r => r && r.some(v => String(v ?? '').trim() === 'N°dossard'));
+    if (iEntete < 0) return null;
+    const ent = lignes[iEntete].map(v => String(v ?? '').trim());
+    const col = n => ent.indexOf(n);
+    const k = { id:col('ID'), epr:col('Epr.'), cat:col('Cat.'), lic:col('N° licence'), serie:col('N°Série'), poste:col('N°Poste'),
+                dos:col('N°dossard'), nom:col('Nom'), prenom:col('Prénom'), epreuve:col('Épreuve'), categorie:col('Catégorie') };
+    const colonnes = {};   // nom d'en-tête -> index de colonne (pour l'écriture)
+    ent.forEach((n, i) => { if (n) colonnes[n] = i; });
+    const parEpreuve = new Map();
+    for (let i = iEntete + 1; i < lignes.length; i++){
+      const r = lignes[i]; if (!r) continue;
+      const d = String(r[k.dos] ?? '').trim(); if (!/^\d+$/.test(d)) continue;
+      const epreuve = String(r[k.epreuve] ?? r[k.epr] ?? '').trim() || 'Épreuve ?';
+      if (!parEpreuve.has(epreuve)) parEpreuve.set(epreuve, []);
+      parEpreuve.get(epreuve).push({
+        dossard:d, nom:String(r[k.nom] ?? '').trim(), prenom:String(r[k.prenom] ?? '').trim(), nation:'',
+        club:'', cat:String(r[k.cat] ?? r[k.categorie] ?? '').trim(), cible:r[k.poste] == null ? '' : String(r[k.poste]).trim(),
+        licence:String(r[k.lic] ?? '').trim(), id:String(r[k.id] ?? '').trim(),
+        ref:{ feuille:nomFeuille, ligne:ligneDepart + i, colonnes }
+      });
+    }
+    return { colonnes, onglets:[...parEpreuve.entries()].map(([ep, tireurs]) => ({ nom:`${nomFeuille} – ${ep}`, tireurs, saisie:true })) };
+  },
+
+  // Liste des cellules à écrire dans le fichier de saisie hors ligne
+  // -> [{ feuille, ligne (0 = 1re ligne), colonne (0 = A), valeur }]
+  cellulesSaisie(calcul){
+    const ecr = [], manques = [];
+    for (const g of calcul.disciplines) for (const l of g.lignes){
+      if (!l.ref){ continue; }
+      l.auDixieme = g.auDixieme;
+      const C = l.ref.colonnes, put = (nomCol, v) => {
+        if (C[nomCol] === undefined){ manques.push(nomCol); return; }
+        ecr.push({ feuille:l.ref.feuille, ligne:l.ref.ligne, colonne:C[nomCol], valeur:v });
+      };
+      l.series.slice(0, 14).forEach((s, i) => {
+        put(`Série ${i+1}`, l.auDixieme ? s.dec : s.pts);
+        put(`S${i+1} - Nombre de 10s`, s.n10);
+        put(`S${i+1} - Mouche`, s.mouche);
+      });
+      put('Nombre de 10s', l.n10); put('Nombre de 9s', l.n9); put('Nombre de 8s', l.n8); put('Nombre de 7s', l.n7);
+      put('Mouche', l.mouches);
+    }
+    return { ecr, manques:[...new Set(manques)] };
+  },
+
+  // depart (facultatif) : liste de départ chargée dans SIUS le jour du match, pour retrouver
+  // les tireurs par leur nom quand ISIS WEB a renuméroté les dossards depuis.
+  calculer(coupsBruts, onglets, depart = null){
+    const C = this.C, alertes = [];
+    // 1. Coups de match, dédoublonnés (si deux exports se chevauchent)
+    const vus = new Set(), coups = [];
+    let nbEssais = 0, nbDoublons = 0;
+    for (const { cols:c } of coupsBruts){
+      if (c[C.MATCH] !== '1'){ nbEssais++; continue; }
+      const cle = [c[C.DOSSARD], c[C.CIBLE], c[C.NUMTIR], c[C.HEURE], c[C.VALEUR]].join('|');
+      if (vus.has(cle)){ nbDoublons++; continue; }
+      vus.add(cle); coups.push(c);
+    }
+
+    // 2. Sessions = dossard + poste + mode de comptage (un même dossard peut tirer plusieurs disciplines)
+    //    Un nouveau match commence quand la numérotation des tirs SIUS repart en arrière.
+    const groupesCoups = new Map();
+    for (const c of coups){
+      const cle = c[C.DOSSARD] + '|' + c[C.CIBLE] + '|' + c[C.MODE];
+      if (!groupesCoups.has(cle)) groupesCoups.set(cle, []);
+      groupesCoups.get(cle).push(c);
+    }
+    const sessions = [];
+    for (const liste of groupesCoups.values()){
+      liste.sort((a,b) => String(a[C.HEURE]).localeCompare(String(b[C.HEURE])) || (+a[C.NUMTIR]) - (+b[C.NUMTIR]));
+      let cur = null, prec = -1;
+      for (const c of liste){
+        const n = +c[C.NUMTIR];
+        if (!cur || n <= prec){ cur = { dossard:c[C.DOSSARD], poste:c[C.CIBLE], mode:c[C.MODE], debut:String(c[C.HEURE]), coups:[] }; sessions.push(cur); }
+        cur.coups.push(c); prec = n;
+      }
+    }
+
+    // 3. Index ISIS par dossard, et par nom (si les dossards ont été renumérotés depuis le match)
+    const norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z]/g, '');
+    const cleNom = t => norm(t.nom) + '|' + norm(t.prenom);
+    const parDossard = new Map(), parNom = new Map();
+    onglets.forEach((o, io) => o.tireurs.forEach(t => {
+      const x = { onglet:o.nom, io, t };
+      if (!parDossard.has(t.dossard)) parDossard.set(t.dossard, []);
+      parDossard.get(t.dossard).push(x);
+      if (!parNom.has(cleNom(t))) parNom.set(cleNom(t), []);
+      parNom.get(cleNom(t)).push(x);
+    }));
+    // Liste de départ chargée dans SIUS le jour du match : dossard SIUS -> nom/prénom
+    const nomDepart = new Map();
+    if (depart) depart.forEach(o => o.tireurs.forEach(t => { if (!nomDepart.has(t.dossard)) nomDepart.set(t.dossard, t); }));
+    let nbRenum = 0;
+
+    const resultats = [], utilises = new Set(), detail = [];
+    const sessionsTriees = sessions.sort((a,b) => +a.dossard - +b.dossard || a.debut.localeCompare(b.debut));
+
+    for (const s of sessionsTriees){
+      s.coups.sort((a,b) => (+a[C.NUMTIR]) - (+b[C.NUMTIR]));
+      // Mode de comptage : 60 = entier + décimal séparé (pistolet), 61 = décimal (carabine)
+      const premier = s.coups[0];
+      let modeEntier = premier[C.COMPTAGE] === '60';
+      if (premier[C.COMPTAGE] !== '60' && premier[C.COMPTAGE] !== '61') modeEntier = s.coups.some(c => parseFloat(c[C.DECIMAL]) > 0);
+
+      const series = new Map(); const remarques = []; const compte = {}; let nb = 0;
+      for (const c of s.coups){
+        let pts, dec;
+        if (modeEntier){ pts = parseInt(c[C.VALEUR], 10); dec = parseFloat(c[C.DECIMAL]); }
+        else { dec = parseFloat(c[C.VALEUR]); pts = Math.min(10, Math.floor(dec + 1e-9)); }
+        if (isNaN(dec)) dec = pts;
+        const exclu = c[C.STATUT] === '2';
+        detail.push({ dossard:s.dossard, poste:s.poste, serie:+c[C.SERIE], num:+c[C.NUMTIR], heure:c[C.HEURE], pts, dec, exclu });
+        if (exclu){ remarques.push(`Coup hors programme exclu (tir n°${c[C.NUMTIR]} : ${dec.toFixed(1)})`); continue; }
+        const k = +c[C.SERIE] || 0;
+        if (!series.has(k)) series.set(k, { pts:0, dec:0, n:0, n10:0, mouche:0 });
+        const se = series.get(k); se.pts += pts; se.dec += dec; se.n++; nb++;
+        if (pts === 10){ se.n10++; if (c[C.MOUCHE] === '1') se.mouche++; }
+        compte[pts] = (compte[pts] || 0) + 1;
+      }
+      const listeSeries = [...series.entries()].sort((a,b) => a[0]-b[0]).map(e => e[1]);
+      listeSeries.forEach((se, i) => { if (se.n !== 10) remarques.push(`Série ${i+1} : ${se.n} coups au lieu de 10`); });
+      if (nb % 10 !== 0) remarques.push(`${nb} coups comptés (programme incomplet ?)`);
+
+      // Rattachement au tireur ISIS
+      let cands = parDossard.get(s.dossard) || [];
+      let identite = null;
+      if (depart){
+        identite = nomDepart.get(s.dossard);
+        cands = identite ? (parNom.get(cleNom(identite)) || []) : [];
+        if (!identite) alertes.push(`Dossard SIUS ${s.dossard} absent de la liste de départ SIUS chargée.`);
+        else if (!cands.length) alertes.push(`Dossard SIUS ${s.dossard} (${identite.nom} ${identite.prenom}) introuvable par son nom dans la saisie ISIS WEB.`);
+      }
+      const libre = x => !utilises.has(x.onglet + '|' + x.t.dossard);
+      let choix = null;
+      if (cands.length === 1) choix = libre(cands[0]) ? cands[0] : null;
+      else if (cands.length > 1){
+        choix = cands.find(x => x.t.cible === s.poste && libre(x)) || cands.find(libre);
+        if (choix && choix.t.cible !== s.poste) remarques.push(`Inscrit dans ${cands.length} épreuves ISIS : rattaché par ordre chronologique à « ${choix.onglet} », à vérifier`);
+      }
+      if (cands.length && !choix) alertes.push(`Dossard SIUS ${s.dossard} : un match de trop par rapport aux inscriptions ISIS (poste ${s.poste}), non rattaché.`);
+      if (choix){ utilises.add(choix.onglet + '|' + choix.t.dossard); if (choix.t.dossard !== s.dossard) nbRenum++; }
+      if (choix && /CARABINE|\bCar\./i.test(choix.onglet) && !/3\s*[xX×]\s*20/.test(choix.onglet) && modeEntier) remarques.push('Cible en mode comptage pistolet (entier + décimal)');
+      if (choix && choix.t.cible && choix.t.cible !== s.poste) remarques.push(`Poste SIUS ${s.poste} ≠ poste ISIS ${choix.t.cible}`);
+      if (!choix && !depart && !cands.length) alertes.push(`Dossard ${s.dossard} (poste ${s.poste}) présent dans SIUS mais absent du plan ISIS.`);
+
+      // Carabine = toujours au dixième ; pistolet = points entiers
+      // Carabine au dixième, SAUF la 3x20 (points entiers) ; pistolet en points entiers
+      const est3x20 = choix && /3\s*[xX×]\s*20/.test(choix.onglet);
+      const auDixieme = est3x20 ? false
+                      : choix && /CARABINE|\bCar\./i.test(choix.onglet) ? true
+                      : choix && /PISTOLET/i.test(choix.onglet) ? false
+                      : !modeEntier;
+      const totPts = listeSeries.reduce((a,b) => a + b.pts, 0);
+      const totDec = Math.round(listeSeries.reduce((a,b) => a + b.dec, 0) * 10) / 10;
+      resultats.push({
+        onglet: choix ? choix.onglet : 'Dossards inconnus du plan ISIS',
+        ordreOnglet: choix ? choix.io : 9999,
+        dossard: choix ? choix.t.dossard : s.dossard, dossardSius:s.dossard, poste:s.poste,
+        nom: choix ? choix.t.nom : (identite ? identite.nom : '?'),
+        prenom: choix ? choix.t.prenom : (identite ? identite.prenom : ''), club: choix ? choix.t.club : '', cat: choix ? choix.t.cat : '',
+        modeEntier, auDixieme, series: listeSeries.map(se => ({ pts:se.pts, dec:Math.round(se.dec*10)/10, n10:se.n10, mouche:se.mouche })),
+        n10:compte[10]||0, n9:compte[9]||0, n8:compte[8]||0, n7:compte[7]||0,
+        mouches: listeSeries.reduce((a,b) => a + b.mouche, 0),
+        ref: choix && choix.t.ref ? choix.t.ref : null,
+        posteIsis: choix ? choix.t.cible : '',
+        nb, totPts, totDec, maxPts: nb*10, maxDec: Math.round(nb*109)/10, remarques
+      });
+    }
+
+    // Tireurs ISIS sans aucun coup
+    const absents = new Map();
+    onglets.forEach(o => o.tireurs.forEach(t => {
+      if (!utilises.has(o.nom + '|' + t.dossard)){
+        if (!absents.has(o.nom)) absents.set(o.nom, []);
+        absents.get(o.nom).push(t);
+      }
+    }));
+
+    // Groupement par discipline + classement
+    const groupes = new Map();
+    for (const r of resultats){
+      if (!groupes.has(r.onglet)) groupes.set(r.onglet, { nom:r.onglet, ordre:r.ordreOnglet, lignes:[] });
+      groupes.get(r.onglet).lignes.push(r);
+    }
+    const disciplines = [...groupes.values()].sort((a,b) => a.ordre - b.ordre);
+    for (const g of disciplines){
+      g.auDixieme = g.lignes.filter(l => l.auDixieme).length * 2 >= g.lignes.length;
+      g.lignes.sort((a,b) => (b.nb - a.nb) || (g.auDixieme ? (b.totDec - a.totDec) || (b.totPts - a.totPts)
+                                                          : (b.totPts - a.totPts) || (b.totDec - a.totDec)));
+      g.nbSeriesMax = Math.max(...g.lignes.map(l => l.series.length));
+    }
+    if (nbDoublons) alertes.push(`${nbDoublons} coup(s) en double ignoré(s) (fichiers SIUS qui se chevauchent).`);
+    // Contrôle de cohérence : les postes SIUS doivent globalement correspondre aux postes ISIS
+    const compares = resultats.filter(r => r.posteIsis && /^\d+$/.test(r.posteIsis));
+    const differents = compares.filter(r => r.posteIsis !== r.poste);
+    const nonTrouves = resultats.filter(r => r.ordreOnglet === 9999).length;
+    if (nbRenum) alertes.push(`Dossards renumérotés dans ISIS WEB depuis le match : ${nbRenum} tireur(s) retrouvé(s) par leur nom grâce à la liste de départ SIUS.`);
+    const incoherent = (compares.length >= 3 && differents.length / compares.length > 0.5) || (resultats.length >= 3 && nonTrouves / resultats.length > 0.5);
+    if (incoherent) alertes.unshift(`⚠️ ATTENTION : le fichier SIUS ne semble PAS correspondre à cette compétition ISIS (${differents.length} poste(s) sur ${compares.length} ne correspondent pas, ${nonTrouves} dossard(s) introuvable(s)). Les scores risquent d’être attribués aux mauvais tireurs : vérifie que les deux fichiers viennent de la même compétition avant tout import.`);
+    return { disciplines, absents, alertes, detail, nbCoups:coups.length, nbEssais, incoherent, nbRenum };
+  }
+};
+// Essaie la correspondance directe par dossard, puis par nom via chaque liste de départ,
+// et garde celle dont les postes SIUS collent le mieux aux postes ISIS.
+SIUS.meilleurCalcul = function(coups, onglets, listes){
+  const score = r => r.disciplines.reduce((a,g) => a + g.lignes.filter(l => l.ordreOnglet !== 9999 && String(l.posteIsis) === String(l.poste)).length, 0);
+  let meilleur = this.calculer(coups, onglets); meilleur.methode = 'dossard';
+  let sm = score(meilleur);
+  for (const l of (listes || [])){
+    const r = this.calculer(coups, onglets, l.onglets), sc = score(r);
+    if (sc > sm || (sc === sm && meilleur.incoherent && !r.incoherent)){ meilleur = r; sm = sc; meilleur.methode = 'nom via ' + l.nom; }
+  }
+  return meilleur;
+};
+if (typeof module !== 'undefined') module.exports = SIUS;
+</script>
+
+<!-- ===================== Interface ===================== -->
+<script>
+(function(){
+  if (typeof document === 'undefined') return;
+  const $ = id => document.getElementById(id);
+  let fichiersSius = [], ongletsIsis = null, nomIsis = '', calcul = null, wbIsis = null, estSaisie = false;
+
+  function majEtat(){
+    $('btnCalcul').disabled = !(fichiersSius.length && ongletsIsis);
+    if (fichiersSius.length && ongletsIsis) $('etat').textContent = 'Prêt — clique sur « Reconstituer les matchs ».';
+  }
+
+  function brancherZone(zone, input, gerer){
+    ['dragenter','dragover'].forEach(e => zone.addEventListener(e, ev => { ev.preventDefault(); zone.classList.add('survol'); }));
+    ['dragleave','drop'].forEach(e => zone.addEventListener(e, ev => { ev.preventDefault(); zone.classList.remove('survol'); }));
+    zone.addEventListener('drop', ev => gerer([...ev.dataTransfer.files]));
+    input.addEventListener('change', () => gerer([...input.files]));
+  }
+
+  const lireTexte = f => new Promise((ok, ko) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = ko; r.readAsText(f, 'utf-8'); });
+  const lireBinaire = f => new Promise((ok, ko) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = ko; r.readAsArrayBuffer(f); });
+
+  brancherZone($('zoneSius'), $('fichierSius'), async files => {
+    for (const f of files){
+      const texte = await lireTexte(f);
+      const coups = SIUS.lireCsv(texte, f.name);
+      if (!coups.length){ alert(`« ${f.name} » ne ressemble pas à un export SIUS (aucune ligne de tir reconnue).`); continue; }
+      fichiersSius = fichiersSius.filter(x => x.nom !== f.name);
+      fichiersSius.push({ nom:f.name, coups });
+    }
+    $('nomSius').innerHTML = fichiersSius.map(x => `✔ ${x.nom} — ${x.coups.length} lignes`).join('<br>');
+    $('zoneSius').classList.toggle('chargee', fichiersSius.length > 0);
+    majEtat();
+  });
+
+  // Zone 2 : un ou plusieurs fichiers ISIS WEB
+  //  - « Saisie hors ligne » (à remplir pour le réimport)
+  //  - liste(s) « SIUS - ….xlsx » / « competition_shots » (liste de départ)
+  let saisieOnglets = null, listes = [];
+  function majIsis(){
+    ongletsIsis = saisieOnglets || (listes[0] ? listes[0].onglets : null);
+    estSaisie = !!saisieOnglets;
+    const l = [];
+    if (saisieOnglets) l.push(`✔ ${nomIsis} — saisie hors ligne ISIS WEB, ${saisieOnglets.reduce((a,o) => a + o.tireurs.length, 0)} engagements`);
+    listes.forEach(x => l.push(`✔ ${x.nom} — liste de départ, ${x.onglets.reduce((a,o) => a + o.tireurs.length, 0)} engagements`));
+    $('nomIsis').innerHTML = l.map(esc).join('<br>');
+    $('zoneIsis').classList.toggle('chargee', l.length > 0);
+    majEtat();
+  }
+  brancherZone($('zoneIsis'), $('fichierIsis'), async files => {
+    for (const f of files){
+      try{
+        const wb = await MiniXLSX.lire(await lireBinaire(f));
+        const lire = n => ({ lignes:wb.Sheets[n] || [], depart:0 });
+        const saisies = wb.SheetNames.map(n => { const { lignes, depart } = lire(n); return SIUS.lireSaisieHorsLigne(n, lignes, depart); });
+        if (saisies.some(Boolean)){
+          const o = saisies.filter(Boolean).flatMap(s => s.onglets);
+          if (!o.length) throw new Error('le fichier de saisie hors ligne ne contient aucun tireur (seulement les en-têtes). Ré-exporte-le depuis ISIS WEB une fois les séries et les postes constitués.');
+          saisieOnglets = o; wbIsis = wb; nomIsis = f.name;
+        } else {
+          const o = wb.SheetNames.map(n => SIUS.lireIsisDepuisLignes(n, lire(n).lignes)).filter(o => o.tireurs.length);
+          if (!o.length) throw new Error('aucun tireur trouvé');
+          listes = listes.filter(x => x.nom !== f.name); listes.push({ nom:f.name, onglets:o });
+        }
+      }catch(e){ alert(`Impossible d’utiliser « ${f.name} » : ${e.message}`); }
+    }
+    majIsis();
+  });
+
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+  $('btnCalcul').addEventListener('click', () => {
+    calcul = SIUS.meilleurCalcul(fichiersSius.flatMap(x => x.coups), ongletsIsis, estSaisie ? listes : []);
+    const nbTireurs = calcul.disciplines.reduce((a,g) => a + g.lignes.length, 0);
+    let h = `<div class="bilan"><b>${nbTireurs}</b> matchs reconstitués · <b>${calcul.nbCoups}</b> coups de match lus · ${calcul.nbEssais} essais écartés · ${calcul.disciplines.length} discipline(s) · rattachement : <b>${calcul.methode === 'dossard' ? 'par n° de dossard' : 'par nom (' + esc(calcul.methode.slice(8)) + ')'}</b></div>`;
+
+    const toutesRem = [];
+    calcul.disciplines.forEach(g => g.lignes.forEach(l => l.remarques.forEach(r => toutesRem.push(`Dossard ${l.dossard} ${l.nom} ${l.prenom} — ${r}`))));
+    const alertes = [...calcul.alertes, ...toutesRem.filter(r => !/Poste SIUS/.test(r))];
+    if (alertes.length) h += `<div class="alertes"><h3>Points à vérifier</h3><ul>${alertes.map(a => `<li>${esc(a)}</li>`).join('')}</ul></div>`;
+
+    for (const g of calcul.disciplines){
+      const n = g.nbSeriesMax, d = g.auDixieme;
+      h += `<section class="discipline"><h3>${esc(g.nom)}<span>${g.lignes.length} tireur(s) · comptage ${d ? 'au dixième' : 'en points entiers'}</span></h3><div class="defile"><table><thead><tr>
+        <th>Rg</th><th>Dossard</th><th class="g">Nom</th><th class="g">Prénom</th><th class="g">Club</th><th>Cat.</th><th>Poste</th>
+        ${Array.from({length:n}, (_,i) => `<th>S${i+1}</th>`).join('')}<th>Total</th><th class="info">${d ? 'Entier (info)' : '1/10 (info)'}</th><th class="g">Remarques</th></tr></thead><tbody>`;
+      g.lignes.forEach((l, i) => {
+        h += `<tr><td class="rang">${i+1}</td><td>${esc(l.dossard)}${l.dossardSius !== l.dossard ? `<span class="dec">SIUS ${esc(l.dossardSius)}</span>` : ''}</td><td class="g">${esc(l.nom)}</td><td class="g">${esc(l.prenom)}</td><td class="g">${esc(l.club)}</td><td>${esc(l.cat)}</td><td>${esc(l.poste)}</td>
+          ${Array.from({length:n}, (_,k) => { const s = l.series[k]; return s ? `<td>${d ? s.dec.toFixed(1) : s.pts}</td>` : '<td>–</td>'; }).join('')}
+          <td class="tot">${d ? l.totDec.toFixed(1) : l.totPts}<span class="dec">/ ${d ? l.maxDec.toFixed(1) : l.maxPts}</span></td>
+          <td class="info">${d ? l.totPts : l.totDec.toFixed(1)}</td>
+          <td class="rem">${esc(l.remarques.join(' · '))}</td></tr>`;
+      });
+      h += `</tbody></table></div>`;
+      const abs = calcul.absents.get(g.nom);
+      if (abs && abs.length) h += `<div class="absents">Sans tirs dans l’export SIUS : ${abs.map(t => esc(`${t.dossard} ${t.nom} ${t.prenom}`)).join(', ')}</div>`;
+      h += `</section>`;
+    }
+    const ongletsSansTirs = ongletsIsis.filter(o => !calcul.disciplines.some(g => g.nom === o.nom));
+    if (ongletsSansTirs.length) h += `<div class="bilan">Séries ISIS sans aucun tir dans l’export SIUS chargé : ${ongletsSansTirs.map(o => esc(o.nom)).join(' · ')}</div>`;
+
+    $('resultats').innerHTML = h;
+    $('btnExport').classList.remove('cache');
+    $('btnIsis').classList.toggle('cache', !estSaisie);
+    $('etat').textContent = 'Résultats prêts.';
+  });
+
+  $('btnExport').addEventListener('click', () => {
+    if (!calcul) return;
+    const aoa = [], fusion = [];
+    const maxSeries = Math.max(...calcul.disciplines.map(g => g.nbSeriesMax));
+    for (const g of calcul.disciplines){
+      const d = g.auDixieme;
+      aoa.push([`${g.nom} — comptage ${d ? 'au dixième' : 'en points entiers'}`]);
+      aoa.push(['Rang','Dossard','Dossard SIUS','Nom','Prénom','Club','Cat.','Poste SIUS', ...Array.from({length:maxSeries}, (_,i) => `S${i+1}`), 'Total','Max', d ? 'Entier (info)' : '1/10 (info)','Nb coups','Remarques']);
+      g.lignes.forEach((l, i) => aoa.push([i+1, +l.dossard, +l.dossardSius, l.nom, l.prenom, l.club, l.cat, +l.poste,
+        ...Array.from({length:maxSeries}, (_,k) => l.series[k] ? (d ? l.series[k].dec : l.series[k].pts) : ''),
+        d ? l.totDec : l.totPts, d ? l.maxDec : l.maxPts, d ? l.totPts : l.totDec, l.nb, l.remarques.join(' · ')]));
+      aoa.push([]);
+    }
+    const largeurs1 = [6,8,8,22,14,24,6,9, ...Array(maxSeries).fill(7), 8,7,12,8,60];
+    const gras1 = []; aoa.forEach((l, i) => { if (l.length === 1 || l[0] === 'Rang') gras1.push(i); });
+
+    const index = new Map();
+    calcul.disciplines.forEach(g => g.lignes.forEach(l => index.set(l.dossardSius + '|' + l.poste, l)));
+    const det = [['Dossard','Nom','Prénom','Discipline','Poste','Série','N° tir','Heure','Points','Décimal','Statut']];
+    calcul.detail.forEach(d => { const l = index.get(d.dossard + '|' + d.poste) || {};
+      det.push([+d.dossard, l.nom||'', l.prenom||'', l.onglet||'', +d.poste, d.serie, d.num, d.heure, d.pts, d.dec, d.exclu ? 'EXCLU (hors programme)' : '']); });
+    const octets = MiniXLSX.creer([
+      { nom:'Résultats', lignes:aoa, largeurs:largeurs1, gras:gras1 },
+      { nom:'Détail coups', lignes:det, largeurs:[8,22,14,34,6,6,7,12,7,8,22], gras:[0] } ]);
+    const m = (fichiersSius[0]?.nom || '').match(/(20\d{2})(\d{2})(\d{2})/);
+    const date = m ? `${m[3]}-${m[2]}-${m[1]}` : new Date().toLocaleDateString('fr-FR').replace(/\//g,'-');
+    MiniXLSX.telecharger(octets, `Reconstitution_SIUS_${date}.xlsx`);
+  });
+
+  // Remplissage du fichier « Saisie hors ligne » pour réimport dans ISIS WEB
+  $('btnIsis').addEventListener('click', () => {
+    if (!calcul || !wbIsis) return;
+    if (calcul.incoherent && !confirm('ATTENTION : le fichier SIUS ne semble pas correspondre à cette compétition ISIS (postes différents).\nLes scores risquent d’aller aux mauvais tireurs.\n\nGénérer quand même le fichier ?')) return;
+    const { ecr, manques } = SIUS.cellulesSaisie(calcul);
+    if (manques.length && !confirm(`Colonnes introuvables dans le fichier ISIS (non remplies) : ${manques.join(', ')}.\nContinuer quand même ?`)) return;
+    // Le fichier ISIS d'origine est modifié cellule par cellule : sa mise en forme est conservée
+    let octets;
+    try { octets = MiniXLSX.modifier(wbIsis, ecr); }
+    catch(e){ alert('Impossible de générer le fichier : ' + e.message); return; }
+    const nbTireurs = new Set(ecr.map(e => e.feuille + '|' + e.ligne)).size;
+    MiniXLSX.telecharger(octets, nomIsis.replace(/\.xlsx?$/i, '') + '_rempli.xlsx');
+    $('etat').textContent = `Fichier ISIS WEB généré : ${nbTireurs} tireur(s) rempli(s). À importer via « Importer saisie hors ligne ».`;
+  });
+
+  $('btnRaz').addEventListener('click', () => location.reload());
+})();
+</script>
+</body>
+</html>
